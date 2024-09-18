@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import binascii
+import glob
+import hashlib
+import hmac
+import os
+import sys
+from datetime import datetime
+from multiprocessing.dummy import Pool
+from xml.etree import ElementTree as XML
+
+import requests
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+
+__version__ = '1.0.0'
+
+
+class S3(object):
+    class KeyObject(object):
+        def __init__(self, key, last_modified, etag, size):
+            self.key = key
+            self.last_modified = last_modified
+            self.etag = etag
+            self.size = size
+
+        def signature(self):
+            string = f'{self.key}\n{self.last_modified}\n{self.etag}\n{self.size}'
+            return hashlib.sha256(string.encode('utf-8')).hexdigest()
+
+        def __str__(self):
+            return self.key
+
+        def __repr__(self):
+            return self.key
+
+    NS = {
+        's3': 'http://s3.amazonaws.com/doc/2006-03-01/'
+    }
+
+    def __init__(self, access_key_id, secret_access_key, bucket, region='us-east-1'):
+        urllib3.disable_warnings(category=InsecureRequestWarning)
+
+        self._access_key_id = access_key_id
+        self._secret_access_key = secret_access_key.encode('utf-8')
+        self._bucket = bucket
+        self._region = region
+
+    @staticmethod
+    def _http_now():
+        return datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+
+    def _signature_of(self, verb, date, resource, content_md5='', content_type=''):
+        string = f'{verb}\n{content_md5}\n{content_type}\n{date}\n{resource}'
+        hmac_sha1 = hmac.new(self._secret_access_key, string.encode('utf-8'), hashlib.sha1)
+        return base64.encodebytes(hmac_sha1.digest()).decode('utf-8').rstrip('\n')
+
+    def _http_get(self, bucket, key=''):
+        http_date = self._http_now()
+        signature = self._signature_of('GET', http_date, f'/{bucket}/{key}')
+        response = requests.get(f'https://{bucket}.s3.{self._region}.amazonaws.com/{key}', verify=False,
+                                headers={
+                                    'Date': http_date,
+                                    'Authorization': f'AWS {self._access_key_id}:{signature}'
+                                })
+
+        if response.status_code != 200:
+            raise IOError(f'Error {response.status_code}: {response.text}')
+
+        return XML.fromstring(response.text) if key == '' else response.text
+
+    def list(self):
+        list_bucket_result = self._http_get(self._bucket)
+        if list_bucket_result.find('s3:IsTruncated', self.NS).text != 'false':
+            raise IOError('List bucket result is truncated')
+
+        result = []
+        for contents in list_bucket_result.findall('s3:Contents', self.NS):
+            key = contents.find('s3:Key', self.NS).text
+            last_modified = contents.find('s3:LastModified', self.NS).text
+            etag = contents.find('s3:ETag', self.NS).text
+            size = int(contents.find('s3:Size', self.NS).text)
+
+            if key.endswith('.pub'):
+                result.append(self.KeyObject(key, last_modified, etag, size))
+
+        return result
+
+    def get(self, key):
+        return self._http_get(self._bucket, key).strip()
+
+
+class ExtraAuthorizedKeys(object):
+    class ExtraKey(object):
+        def __init__(self, filename):
+            self.filename = filename
+            self.name = os.path.basename(filename)
+            with open(filename, 'r', encoding='utf-8') as f:
+                self.content = f.read().rstrip('\n')
+
+        def signature(self):
+            return hashlib.sha256(self.content.encode('utf-8')).hexdigest()
+
+        def __str__(self):
+            return self.filename
+
+        def __repr__(self):
+            return self.filename
+
+    def __init__(self, path):
+        self.root = path
+
+    def list(self):
+        if not os.path.exists(self.root):
+            return []
+        return [self.ExtraKey(filename) for filename in glob.glob(os.path.join(self.root, '*.pub'))]
+
+
+class SSHAuthorizedKeys(object):
+    def __init__(self, s3_bucket):
+        self._s3_bucket = s3_bucket
+        self._authorized_keys_file = os.path.expanduser("~/.ssh/authorized_keys")
+        self._extra_keys = ExtraAuthorizedKeys(os.path.expanduser("~/.ssh/extra_authorized_keys"))
+        self._signature_file = os.path.expanduser("~/.ssh/.authorized_keys.sign")
+
+    def _read_signature_file(self):
+        if os.path.exists(self._signature_file):
+            with open(self._signature_file, 'r') as f:
+                try:
+                    target_signature, local_signature = f.read().strip().split('\n')
+                    return target_signature, local_signature
+                except:
+                    return None, None
+        else:
+            return None, None
+
+    def _write_signature_file(self, target_signature, local_signature):
+        with open(self._signature_file, 'w') as f:
+            f.write(f'{target_signature}\n{local_signature}\n')
+
+    @staticmethod
+    def validate(key_name, key_content):
+        if not key_content.startswith('ssh-rsa '):
+            raise ValueError('Key must start with "ssh-rsa ": ' + key_content)
+
+        key_parts = key_content.split(' ', 2)
+        if len(key_parts) != 3:
+            raise ValueError('Key must have 3 parts: ' + key_content)
+
+        key_name_parts = key_name.split('.', 1)
+        if len(key_name_parts) != 2:
+            raise ValueError('Key name must have 2 parts: ' + key_name)
+
+        if key_name_parts[0] != key_parts[2]:
+            raise ValueError('Key name must match filename (' + key_name + '): ' + key_content)
+
+        try:
+            base64.decodebytes(key_parts[1].encode('utf-8'))
+        except binascii.Error:
+            raise ValueError('Key must be base64 encoded: ' + key_content)
+
+    @staticmethod
+    def target_signature_of(aws_keys, extra_keys):
+        signatures = [key.signature() for key in aws_keys] + [key.signature() for key in extra_keys]
+        return hashlib.sha256('\n\n'.join(signatures).encode('utf-8')).hexdigest()
+
+    def local_signature(self):
+        if os.path.exists(self._authorized_keys_file):
+            with open(self._authorized_keys_file, 'r') as f:
+                return hashlib.sha256(f.read().strip().encode('utf-8')).hexdigest()
+        else:
+            return None
+
+    def sync(self):
+        ex_target_signature, ex_local_signature = self._read_signature_file()
+
+        aws_keys = self._s3_bucket.list()
+        extra_keys = self._extra_keys.list()
+        target_signature = self.target_signature_of(aws_keys, extra_keys)
+        local_signature = self.local_signature()
+
+        if (ex_target_signature is not None and target_signature == ex_target_signature) and \
+                (ex_local_signature is not None and local_signature == ex_local_signature):
+            print('No changes detected')
+            return
+
+        valid_keys = []
+
+        # Resolve and validate AWS keys
+        with Pool(8) as pool:
+            key_contents = pool.map(self._s3_bucket.get, [key.key for key in aws_keys])
+
+        for key_object, key_content in zip(aws_keys, key_contents):
+            try:
+                self.validate(key_object.key, key_content)
+            except ValueError as e:
+                print(f'Invalid key {key_object.key}: {e}', file=sys.stderr)
+                continue
+
+            valid_keys.append(key_content)
+
+        # Resolve and validate extra keys
+        for extra_key in extra_keys:
+            try:
+                self.validate(extra_key.name, extra_key.content)
+            except ValueError as e:
+                print(f'Invalid key {extra_key.filename}: {e}', file=sys.stderr)
+                continue
+
+            valid_keys.append(extra_key.content)
+
+        if len(valid_keys) > 0:
+            with open(self._authorized_keys_file, 'w') as f:
+                f.write('\n'.join(valid_keys))
+                f.write('\n')
+
+            self._write_signature_file(target_signature, self.local_signature())
+
+            print(f'{len(valid_keys)} keys written to {self._authorized_keys_file}')
+
+
+class PrintVersionAndExit(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        print('Vulcan v' + str(__version__))
+        parser.exit()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Sync SSH authorized keys from S3')
+    parser.add_argument('--version', nargs=0, action=PrintVersionAndExit, help='print version and exit')
+    parser.add_argument('bucket', help='S3 bucket name')
+    parser.add_argument('-r', '--region', default='us-east-1', help='S3 region')
+
+    args = parser.parse_args()
+
+    aws_access_key_id = os.environ['AWS_ACCESS_KEY_ID']
+    aws_secret_access_key = os.environ['AWS_SECRET_ACCESS_KEY']
+
+    if not aws_access_key_id or not aws_secret_access_key:
+        raise ValueError('AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set')
+
+    s3_bucket = S3(aws_access_key_id, aws_secret_access_key, args.bucket, region=args.region)
+    ssh_auth_keys = SSHAuthorizedKeys(s3_bucket)
+    ssh_auth_keys.sync()
+
+
+if __name__ == '__main__':
+    main()
