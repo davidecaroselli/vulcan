@@ -2,12 +2,12 @@
 import argparse
 import base64
 import binascii
+import datetime
 import glob
 import hashlib
 import hmac
 import os
 import sys
-from datetime import datetime
 from multiprocessing.dummy import Pool
 from xml.etree import ElementTree as XML
 
@@ -50,7 +50,7 @@ class S3(object):
 
     @staticmethod
     def _http_now():
-        return datetime.utcnow().strftime('%a, %d %b %Y %H:%M:%S GMT')
+        return datetime.datetime.now(datetime.UTC).strftime('%a, %d %b %Y %H:%M:%S GMT')
 
     def _signature_of(self, verb, date, resource, content_md5='', content_type=''):
         string = f'{verb}\n{content_md5}\n{content_type}\n{date}\n{resource}'
